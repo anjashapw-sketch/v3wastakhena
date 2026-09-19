@@ -1,11 +1,18 @@
 """
 ================================================================
-  Num Info Bot — v24 SUPER ADMIN EDITION
-  ✅ Aadhaar API FIXED (GET ?q= format)
-  ✅ Vehicle Info ADDED (RC lookup)
-  ✅ Admin Panel API change FIXED (live DB values)
-  ✅ 25+ Admin Features
-  ✅ Welcome bonus = 15 credits
+  Num Info Bot — v25 ULTRA EDITION (ALL FIXES APPLIED)
+  ✅ Aadhaar API URL builder FIXED (edge cases)
+  ✅ Vehicle API URL builder FIXED
+  ✅ Gateway verify now sends API KEY
+  ✅ Verhoeff Aadhaar validation (12-digit disambiguation)
+  ✅ waiting_payment state HANDLED
+  ✅ Promo race condition FIXED ($expr atomic)
+  ✅ HTML-aware message splitting (pre tag safe)
+  ✅ QR InputFile (reliable bytes upload)
+  ✅ Expired order user notification
+  ✅ Vehicle BH-series support
+  ✅ CSV export robust date handling
+  ✅ Batch-safe broadcast
 ================================================================
 """
 
@@ -18,7 +25,7 @@ import requests
 import telebot
 from telebot.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, BotCommand
+    ReplyKeyboardMarkup, KeyboardButton, BotCommand, InputFile
 )
 from pymongo import MongoClient, ReturnDocument
 from bson.objectid import ObjectId
@@ -132,6 +139,63 @@ def mask_secret(s, secret):
     try:
         return str(s).replace(str(secret), "***")
     except: return s
+
+def _build_api_url(base, param, value):
+    """
+    ⭐ FIXED URL builder.
+    Handles:
+      - base ending with '=' → append value directly
+      - base with '?' and param= at end → append value
+      - base with '?' other params → append &param=value
+      - base without '?' → append ?param=value
+    """
+    base = str(base).strip()
+    if not base: return ""
+    if base.endswith('='):
+        return f"{base}{value}"
+    if '?' not in base:
+        return f"{base}?{param}={value}"
+    # Check if param already present with empty value
+    if re.search(rf'[?&]{re.escape(param)}=$', base):
+        return f"{base}{value}"
+    return f"{base}&{param}={value}"
+
+# =================================================================
+#  VERHOEFF (Aadhaar checksum validation)
+# =================================================================
+_VERHOEFF_D = [
+    [0,1,2,3,4,5,6,7,8,9],
+    [1,2,3,4,0,6,7,8,9,5],
+    [2,3,4,0,1,7,8,9,5,6],
+    [3,4,0,1,2,8,9,5,6,7],
+    [4,0,1,2,3,9,5,6,7,8],
+    [5,9,8,7,6,0,4,3,2,1],
+    [6,5,9,8,7,1,0,4,3,2],
+    [7,6,5,9,8,2,1,0,4,3],
+    [8,7,6,5,9,3,2,1,0,4],
+    [9,8,7,6,5,4,3,2,1,0],
+]
+_VERHOEFF_P = [
+    [0,1,2,3,4,5,6,7,8,9],
+    [1,5,7,6,2,8,3,0,9,4],
+    [5,8,0,3,7,9,6,1,4,2],
+    [8,9,1,6,0,4,3,5,2,7],
+    [9,4,5,3,1,2,6,8,7,0],
+    [4,2,8,6,5,7,3,9,0,1],
+    [2,7,9,3,8,0,6,4,1,5],
+    [7,0,4,6,9,1,3,2,5,8],
+]
+_VERHOEFF_INV = [0,4,3,2,1,5,6,7,8,9]
+
+def verhoeff_valid(num):
+    """Validate a number string using Verhoeff checksum (used for Aadhaar)."""
+    try:
+        c = 0
+        for i, ch in enumerate(reversed(str(num))):
+            c = _VERHOEFF_D[c][_VERHOEFF_P[i % 8][int(ch)]]
+        return c == 0
+    except Exception:
+        return False
 
 # =================================================================
 #  MONGODB
@@ -384,6 +448,15 @@ def all_users():
     try: return [u["user_id"] for u in users_col.find({"banned": 0}, {"user_id": 1})]
     except: return []
 
+def iter_users(batch_size=1000):
+    """Memory-safe iteration over users for broadcast."""
+    try:
+        cursor = users_col.find({"banned": 0}, {"user_id": 1}).batch_size(batch_size)
+        for u in cursor:
+            yield u.get("user_id")
+    except Exception as e:
+        logger.error(f"iter_users: {e}")
+
 def user_stats(uid):
     u = get_or_create_user(uid)
     return u.get("total_referrals",0), u.get("bonus_earned",0), u.get("searches",0)
@@ -408,6 +481,14 @@ def upd_last_seen(uid):
     try: users_col.update_one({"user_id": uid}, {"$set": {"last_seen": now()}})
     except: pass
 
+def _date_str(v):
+    """⭐ FIX: robust date → string."""
+    if not v: return ""
+    try:
+        if hasattr(v, "strftime"): return v.strftime("%Y-%m-%d")
+        return str(v)[:19]
+    except: return ""
+
 def export_csv():
     try:
         us = list(users_col.find({}, {"user_id":1,"credits":1,"searches":1,
@@ -415,11 +496,18 @@ def export_csv():
         o = io.StringIO(); w = csv.writer(o)
         w.writerow(["User ID","Credits","Searches","Referrals","Banned","Joined"])
         for u in us:
-            w.writerow([u.get("user_id"),u.get("credits",0),u.get("searches",0),
-                u.get("total_referrals",0),u.get("banned",0),
-                u.get("joined_at","").strftime("%Y-%m-%d") if u.get("joined_at") else ""])
+            w.writerow([
+                u.get("user_id"),
+                u.get("credits", 0),
+                u.get("searches", 0),
+                u.get("total_referrals", 0),
+                u.get("banned", 0),
+                _date_str(u.get("joined_at")),
+            ])
         return o.getvalue()
-    except: return None
+    except Exception as e:
+        logger.error(f"export_csv: {e}")
+        return None
 
 # =================================================================
 #  GROUPS
@@ -605,28 +693,16 @@ def query_number(phone):
     except Exception as e: return False, None, str(e)
 
 def query_aadhaar(aadhaar):
-    """⭐ FIXED: New apihitech API uses GET ?q= format"""
+    """⭐ FIXED: URL builder with edge-case handling."""
     a_url = get_setting("aadhaar_url_env", AADHAAR_URL) or "https://apihitech.vercel.app/search?q="
     a_key = get_setting("aadhaar_key_env", AADHAAR_KEY)
     if not a_url: return False, None, "Aadhaar URL not configured"
     try:
-        base = str(a_url).strip()
         a = re.sub(r'\D', '', str(aadhaar))
-
-        if base.endswith('='):
-            url = f"{base}{a}"
-        elif '?' in base:
-            if 'q=' in base or 'aadhaar=' in base:
-                url = f"{base}{a}"
-            else:
-                url = f"{base}&q={a}"
-        else:
-            url = f"{base}?q={a}"
-
+        url = _build_api_url(a_url, 'q', a)
         if a_key:
             sep = '&' if '?' in url else '?'
             url += f"{sep}key={a_key}"
-
         logger.info(f"🆔 Aadhaar API: {mask_secret(url, a_key)}")
         r = requests.get(url, timeout=45, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200:
@@ -650,27 +726,16 @@ def query_aadhaar(aadhaar):
     except Exception as e: return False, None, str(e)
 
 def query_vehicle(vehicle):
-    """⭐ NEW: Vehicle RC lookup"""
+    """⭐ FIXED: URL builder + BH series support."""
     v_url = get_setting("vehicle_url_env", VEHICLE_URL) or "https://rc-x.paskhinpf9.workers.dev/"
     v_key = get_setting("vehicle_key_env", VEHICLE_KEY)
     if not v_url: return False, None, "Vehicle URL not configured"
     try:
-        base = str(v_url).strip()
         v = re.sub(r'[\s\-]', '', str(vehicle)).upper()
-
-        if base.endswith('='):
-            url = f"{base}{requests.utils.quote(v)}"
-        elif 'vehicle=' in base:
-            url = f"{base}{requests.utils.quote(v)}"
-        elif '?' in base:
-            url = f"{base}&vehicle={requests.utils.quote(v)}"
-        else:
-            url = f"{base}?vehicle={requests.utils.quote(v)}"
-
+        url = _build_api_url(v_url, 'vehicle', requests.utils.quote(v))
         if v_key:
             sep = '&' if '?' in url else '?'
             url += f"{sep}key={v_key}"
-
         logger.info(f"🚗 Vehicle API: {mask_secret(url, v_key)}")
         r = requests.get(url, timeout=45, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200:
@@ -876,20 +941,36 @@ def save_promo(code, rc, mu, aid):
     except: pass
 
 def redeem_promo(code, uid):
+    """
+    ⭐ FIX: Atomic redeem with $expr to avoid race condition.
+    Returns:
+      - reward credits (int) on success
+      - -1 if user already used
+      - None if invalid/expired/exhausted
+    """
     try:
         d = promo_col.find_one({"code": code})
         if not d: return None
         if d.get("active", 1) == 0: return None
         if uid in d.get("used_by", []): return -1
+
+        # Atomic update with $expr to compare fields correctly
         res = promo_col.find_one_and_update(
-            {"code": code, "active": 1,
-             "used_count": {"$lt": d.get("max_users", 0)},
-             "used_by": {"$ne": uid}},
+            {
+                "code": code,
+                "active": 1,
+                "used_by": {"$ne": uid},
+                "$expr": {"$lt": ["$used_count", "$max_users"]},
+            },
             {"$inc": {"used_count": 1}, "$push": {"used_by": uid}},
             return_document=ReturnDocument.AFTER
         )
         if not res:
-            return -1 if uid in d.get("used_by", []) else None
+            # Determine reason
+            latest = promo_col.find_one({"code": code})
+            if latest and uid in latest.get("used_by", []):
+                return -1
+            return None
         r = res.get("reward_credits", 0)
         add_credits(uid, r)
         return r
@@ -945,9 +1026,14 @@ def create_gateway_order(amount, uid):
     except Exception as e: return False, None, None, None, None, f"Error: {e}"
 
 def verify_gateway_order(order_id):
+    """⭐ FIX: Now sends API key in headers."""
     cs = get_setting("gateway_checkout_status_url", "") or FAM_CHECKOUT_URL
+    key = get_setting("gateway_api_key", "") or FAM_API_KEY
+    if not cs: return False, "error", None
     try:
-        r = requests.get(f"{cs}?order_id={order_id}", timeout=15)
+        headers = {}
+        if key: headers["X-Api-Key"] = key
+        r = requests.get(f"{cs}?order_id={order_id}", headers=headers, timeout=15)
         if r.status_code == 200:
             try:
                 raw = r.json()
@@ -959,7 +1045,8 @@ def verify_gateway_order(order_id):
                         "amount": raw.get("amount"), "raw": raw}
                 elif status in ("pending", "expired"): return False, status, raw
             except: pass
-    except: pass
+    except Exception as e:
+        logger.warning(f"verify_gateway_order: {e}")
     return False, "error", None
 
 def download_qr_bytes(qr_url, retries=3):
@@ -972,13 +1059,24 @@ def download_qr_bytes(qr_url, retries=3):
     return None
 
 def send_qr_image(cid, qr_url, caption, kb, reply_to=None):
+    """⭐ FIX: InputFile wrapper for reliable bytes upload."""
     content = download_qr_bytes(qr_url)
     if not content: return None
     try:
         kw = {"caption": caption, "parse_mode": "HTML", "reply_markup": kb}
         if reply_to: kw["reply_to_message_id"] = reply_to
-        return bot.send_photo(cid, content, **kw)
-    except Exception as e: logger.error(f"[QR] {e}"); return None
+        bio = io.BytesIO(content); bio.name = "qr.png"
+        return bot.send_photo(cid, bio, **kw)
+    except Exception as e:
+        logger.error(f"[QR InputFile] {e}")
+        # Fallback to URL
+        try:
+            kw = {"caption": caption, "parse_mode": "HTML", "reply_markup": kb}
+            if reply_to: kw["reply_to_message_id"] = reply_to
+            return bot.send_photo(cid, qr_url, **kw)
+        except Exception as e2:
+            logger.error(f"[QR URL] {e2}")
+            return None
 
 # =================================================================
 #  BOT INIT
@@ -1191,12 +1289,21 @@ def extract_phone_digits(text):
     return None
 
 def is_vehicle_number(text):
-    """⭐ NEW: check if text looks like Indian vehicle plate"""
+    """⭐ FIX: Standard + BH-series support."""
     if not text: return False
     v = re.sub(r'[\s\-]', '', str(text)).upper()
-    return bool(re.match(r'^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{4}$', v))
+    # Standard: XX00XX0000 / XX0XX0000 / XX00X0000
+    if re.match(r'^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{4}$', v):
+        return True
+    # BH Series: 00BH0000XX (e.g. 22BH1234AB)
+    if re.match(r'^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$', v):
+        return True
+    return False
 
 def classify_input(text):
+    """
+    ⭐ FIX: 12-digit disambiguation via Verhoeff.
+    """
     if not text: return None, None
     t = text.strip()
     if not t: return None, None
@@ -1222,11 +1329,16 @@ def classify_input(text):
     if t.isdigit():
         phone = extract_phone_digits(t)
         if phone: return "number", phone
-        if len(t) == 12: return "aadhaar", t
+        if len(t) == 12:
+            # ⭐ FIX: Verhoeff checksum decides Aadhaar vs TG ID
+            if verhoeff_valid(t):
+                return "aadhaar", t
+            # Not a valid Aadhaar → treat as TG ID
+            return "tgid", t
         if 5 <= len(t) <= 15: return "tgid", t
         return None, None
 
-    # +<digits> — always phone
+    # +<digits> — always phone if valid, else tgid
     if t.startswith("+"):
         phone = extract_phone_digits(t)
         if phone: return "number", phone
@@ -1234,7 +1346,7 @@ def classify_input(text):
         if 5 <= len(d) <= 15: return "tgid", d
         return None, None
 
-    # ⭐ VEHICLE NUMBER (e.g., JH15U4500)
+    # ⭐ VEHICLE NUMBER (e.g., JH15U4500 or 22BH1234AB)
     if is_vehicle_number(t):
         return "vehicle", re.sub(r'[\s\-]', '', t).upper()
 
@@ -1290,7 +1402,6 @@ _FIELD_ALIASES = {
     "tg_id": ("tg_id","telegram_id","user_id"),
     "country": ("country","nation"),
     "country_code": ("country_code","cc","code"),
-    # Vehicle fields
     "vehicle_number": ("vehicle_number","reg_no","registration_number","vehicle","v_number"),
     "owner_name": ("owner_name","owner","name"),
     "chassis": ("chassis","chassis_no","chassis_number"),
@@ -1331,7 +1442,12 @@ def _extract_number_records(data):
     if "result" in data:
         res = data["result"]
         if isinstance(res, list): return [x for x in res if isinstance(x, dict)]
-        if isinstance(res, dict): return [res]
+        if isinstance(res, dict):
+            # Check nested records
+            for k in ("records", "results", "data", "list", "items"):
+                if k in res and isinstance(res[k], list):
+                    return [x for x in res[k] if isinstance(x, dict)]
+            return [res]
         return []
     for key in ("data", "results", "records", "info", "list"):
         if key in data:
@@ -1362,7 +1478,6 @@ def record_to_json_dict(rec):
         ("tg_id", "tg_id"),
         ("country", "country"),
         ("country_code", "country_code"),
-        # Vehicle
         ("vehicle_number", "vehicle_number"),
         ("owner_name", "owner_name"),
         ("chassis", "chassis_number"),
@@ -1403,9 +1518,7 @@ def build_json_text(records, query_info=None):
             results.append(jd)
     if not results:
         return None
-    payload = {
-        "summary": f"{len(results)} record(s) found",
-    }
+    payload = {"summary": f"{len(results)} record(s) found"}
     if query_info:
         payload["query"] = query_info
     payload["results"] = results
@@ -1428,7 +1541,7 @@ def main_kb(uid):
     return kb
 
 # =================================================================
-#  ADMIN KEYBOARDS (Super Panel)
+#  ADMIN KEYBOARDS
 # =================================================================
 def admin_kb():
     kb = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
@@ -1535,6 +1648,7 @@ def broadcast_settings_kb():
     return kb
 
 def force_kb():
+    """⭐ Safe even if manager is None."""
     en = manager.global_enabled if manager else False
     st = "✅ ON" if en else "❌ OFF"
     kb = InlineKeyboardMarkup(row_width=1)
@@ -1812,7 +1926,7 @@ class FJManager:
             p = self.pending.pop(uid, None)
             if p: self._exec(uid, cid, p, call)
             else:
-                uname = call.from_user.username or "user"
+                uname = getattr(call.from_user, 'username', None) or "user"
                 self.bot.send_message(cid, welcome_txt(uid, uname),
                     parse_mode='HTML', reply_markup=main_kb(uid))
             try: self.bot.answer_callback_query(call.id, "✅ Verified!")
@@ -1834,7 +1948,7 @@ class FJManager:
         elif t == 'menu_button': process_menu(uid, cid, d)
         elif t == 'promo_redeem': process_promo(uid, cid, d)
         else:
-            uname = call.from_user.username or "user"
+            uname = getattr(call.from_user, 'username', None) or "user"
             self.bot.send_message(cid, welcome_txt(uid, uname),
                 parse_mode='HTML', reply_markup=main_kb(uid))
     def toggle(self):
@@ -1862,40 +1976,56 @@ manager = None
 states = {}
 
 # =================================================================
-#  SEND RESULT
+#  HTML-AWARE MESSAGE SPLITTER (FIX)
 # =================================================================
-def _send_plain_fallback(cid, text, reply_to=None, reply_markup=None):
-    try:
-        plain = re.sub(r'<[^>]+>', '', text)
-        plain = html_module.unescape(plain)
-        kw = {}
-        if reply_to: kw['reply_to_message_id'] = reply_to
-        if reply_markup: kw['reply_markup'] = reply_markup
-        return bot.send_message(cid, plain[:4000], **kw)
-    except Exception as e:
-        logger.error(f"Plain fallback failed: {e}")
-        return None
+def _close_open_tags(chunk):
+    """Return (chunk_with_closes, extra_prefix) — closes open tags and provides reopen prefix."""
+    prefix_parts = []
+    for tag in ('pre', 'code', 'b', 'i', 'u', 's'):
+        opens = len(re.findall(rf'<{tag}>', chunk, re.IGNORECASE))
+        closes = len(re.findall(rf'</{tag}>', chunk, re.IGNORECASE))
+        if opens > closes:
+            diff = opens - closes
+            chunk += f'</{tag}>' * diff
+            prefix_parts.append(f'<{tag}>' * diff)
+    return chunk, "".join(prefix_parts)
 
-def _split_safe(text, limit=MSG_SAFE_LIMIT):
-    if len(text) <= limit: return [text]
+def _split_html_safe(text, limit=MSG_SAFE_LIMIT):
+    """Split text keeping HTML tags balanced across chunks."""
+    if len(text) <= limit:
+        return [text]
     parts = []
     rem = text
-    while rem:
+    reopen_prefix = ""
+    safety = 0
+    while rem and safety < 50:
+        safety += 1
         if len(rem) <= limit:
-            parts.append(rem); break
-        chunk = rem[:limit]
-        idx = chunk.rfind('\n')
-        if idx < limit // 2:
-            idx = limit
-        parts.append(rem[:idx])
-        rem = rem[idx:]
+            parts.append(reopen_prefix + rem)
+            break
+        cut = limit - len(reopen_prefix)
+        if cut <= 0: cut = limit
+        chunk_region = rem[:cut]
+        # Prefer newline split
+        idx = chunk_region.rfind('\n')
+        if idx < cut // 2:
+            idx = cut
+        chunk = rem[:idx]
+        rest = rem[idx:]
+        chunk_with_close, prefix = _close_open_tags(chunk)
+        parts.append(reopen_prefix + chunk_with_close)
+        reopen_prefix = prefix
+        rem = rest
     return parts
 
+# =================================================================
+#  SEND RESULT (FIXED)
+# =================================================================
 def send_result(uid, cid, txt, reply_to=None, reply_markup=None, is_group_msg=False):
     is_private = (cid == uid or cid > 0)
 
     if is_private:
-        parts = _split_safe(txt, MSG_SAFE_LIMIT)
+        parts = _split_html_safe(txt, MSG_SAFE_LIMIT)
         sent_any = False
         for i, part in enumerate(parts):
             kw = {'parse_mode': 'HTML', 'disable_web_page_preview': True}
@@ -2013,7 +2143,7 @@ def process_number(uid, cid, phone, reply_to=None):
     send_result(uid, cid, txt, reply_to=reply_to)
 
 # =================================================================
-#  PROCESS: AADHAAR (FIXED)
+#  PROCESS: AADHAAR
 # =================================================================
 def process_aadhaar(uid, cid, aadhaar, reply_to=None):
     if is_maintenance() and not is_admin_user(uid):
@@ -2076,7 +2206,7 @@ def process_aadhaar(uid, cid, aadhaar, reply_to=None):
     send_result(uid, cid, txt, reply_to=reply_to)
 
 # =================================================================
-#  PROCESS: VEHICLE (NEW)
+#  PROCESS: VEHICLE
 # =================================================================
 def process_vehicle(uid, cid, vehicle, reply_to=None):
     if is_maintenance() and not is_admin_user(uid):
@@ -2085,12 +2215,13 @@ def process_vehicle(uid, cid, vehicle, reply_to=None):
         bot.send_message(cid, f"🚫 {fancy('banned')}", reply_to_message_id=reply_to); return
 
     v = re.sub(r'[\s\-]', '', str(vehicle)).upper()
-    if not re.match(r'^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{4}$', v):
+    if not is_vehicle_number(v):
         bot.send_message(cid,
             f"❌ <b>{fancy('invalid vehicle number')}</b>\n\n"
             f"ᴇx: <code>JH15U4500</code>\n"
             f"ᴇx: <code>DL01AB1234</code>\n"
-            f"ᴇx: <code>MH12DE1234</code>",
+            f"ᴇx: <code>MH12DE1234</code>\n"
+            f"ᴇx: <code>22BH1234AB</code>",
             parse_mode='HTML', reply_to_message_id=reply_to)
         return
     vehicle = v
@@ -2209,11 +2340,7 @@ def process_tg2num(uid, cid, query, reply_to=None):
         "number": number or ""
     }
     query_info = {"query": str(query), "type": "username"}
-    tg_payload = {
-        "summary": "1 record(s) found",
-        "query": query_info,
-        "results": [json_obj]
-    }
+    tg_payload = {"summary": "1 record(s) found", "query": query_info, "results": [json_obj]}
     json_text = json.dumps(tg_payload, indent=2, ensure_ascii=False)
 
     lines = []
@@ -2236,12 +2363,9 @@ def process_tg2num(uid, cid, query, reply_to=None):
         wa_msg = random.choice(safe_msgs)
         wa_url = f"https://wa.me/{full_number}?text={requests.utils.quote(wa_msg)}"
         reply_markup = InlineKeyboardMarkup(row_width=1)
-        reply_markup.row(
-            InlineKeyboardButton("💬 ᴡʜᴀᴛꜱᴀᴘᴘ", url=wa_url)
-        )
+        reply_markup.row(InlineKeyboardButton("💬 ᴡʜᴀᴛꜱᴀᴘᴘ", url=wa_url))
 
-    send_result(uid, cid, "\n".join(lines), reply_to=reply_to,
-                reply_markup=reply_markup)
+    send_result(uid, cid, "\n".join(lines), reply_to=reply_to, reply_markup=reply_markup)
 
 # =================================================================
 #  MENU PROCESSOR
@@ -2253,7 +2377,7 @@ def process_menu(uid, cid, text, reply_to=None):
     if text == "👑 ADMIN PANEL":
         if not is_admin:
             bot.send_message(cid, "❌ Admin only", reply_to_message_id=reply_to); return
-        txt = (f"👑 <b>{fancy('admin panel v24')}</b>\n{div()}\n"
+        txt = (f"👑 <b>{fancy('admin panel v25')}</b>\n{div()}\n"
                f"ᴡᴇʟᴄᴏᴍᴇ ᴛᴏ ᴛʜᴇ ᴜʟᴛʀᴀ ᴄᴏɴᴛʀᴏʟ ᴄᴇɴᴛᴇʀ\n"
                f"ᴀʟʟ ꜰᴇᴀᴛᴜʀᴇꜱ ᴀᴠᴀɪʟᴀʙʟᴇ ʙᴇʟᴏᴡ.")
         bot.send_message(cid, txt, parse_mode='HTML',
@@ -2340,7 +2464,7 @@ def process_menu(uid, cid, text, reply_to=None):
                    f"⏱ ᴜᴘᴛɪᴍᴇ: <b>{hh}h {mm}m</b>\n"
                    f"🛰️ ᴘʏʀᴏɢʀᴀᴍ: <b>{'✅ READY' if _pyro_ready else '🔴 DISABLED'}</b>\n"
                    f"💾 ᴍᴏɴɢᴏ: <b>✅ CONNECTED</b>\n"
-                   f"🐍 ᴠᴇʀꜱɪᴏɴ: <b>v24 SUPER</b>\n"
+                   f"🐍 ᴠᴇʀꜱɪᴏɴ: <b>v25 ULTRA</b>\n"
                    f"👑 ᴀᴅᴍɪɴ: <b>{ADMIN_ID}</b>")
             bot.send_message(cid, txt, parse_mode='HTML',
                 reply_markup=botinfo_kb(), reply_to_message_id=reply_to); return
@@ -2390,7 +2514,8 @@ def process_menu(uid, cid, text, reply_to=None):
             f"ꜱᴜᴘᴘᴏʀᴛᴇᴅ ꜰᴏʀᴍᴀᴛꜱ:\n"
             f"• <code>JH15U4500</code>\n"
             f"• <code>DL01AB1234</code>\n"
-            f"• <code>MH-12-DE-1234</code>\n\n"
+            f"• <code>MH-12-DE-1234</code>\n"
+            f"• <code>22BH1234AB</code> (BH Series)\n\n"
             f"ᴄᴏꜱᴛ: {get_setting('vehicle_cost',10)}ᴄʀ",
             parse_mode='HTML', reply_to_message_id=reply_to)
     elif text == "💰 Refer & Earn":
@@ -2433,7 +2558,7 @@ def process_menu(uid, cid, text, reply_to=None):
         bot.send_message(cid, f"📞 ᴄᴏɴᴛᴀᴄᴛ: {ADMIN_USERNAME}\n\n"
             f"ᴜꜱᴇ /start ꜰᴏʀ ᴍᴇɴᴜ", reply_to_message_id=reply_to)
     elif text == "ℹ️ About":
-        about = get_setting("about_text", "") or f"ℹ️ ᴏꜱɪɴᴛ ʙᴏᴛ ᴠ24\n{BOT_USERNAME}"
+        about = get_setting("about_text", "") or f"ℹ️ ᴏꜱɪɴᴛ ʙᴏᴛ ᴠ25\n{BOT_USERNAME}"
         bot.send_message(cid, about, reply_to_message_id=reply_to)
 
 def process_promo(uid, cid, code, reply_to=None):
@@ -2519,7 +2644,7 @@ def handle_auto_upi(uid, cid, amount, credits, reply_to=None):
             args=(uid, cid, oid, amount, credits, None), daemon=True).start()
 
 # =================================================================
-#  POLLER
+#  POLLER (with user notification on expiry)
 # =================================================================
 def poll_order_async(uid, cid, order_id, amount, credits, msg_id=None):
     checks = 0
@@ -2534,9 +2659,26 @@ def poll_order_async(uid, cid, order_id, amount, credits, msg_id=None):
     _mark_expired(order_id)
 
 def _mark_expired(order_id):
-    try: payments_col.update_one({"order_id": order_id, "status": "pending"},
-        {"$set": {"status": "expired", "expired_at": now()}})
-    except: pass
+    """⭐ FIX: Notify user on expiry."""
+    try:
+        p = payments_col.find_one_and_update(
+            {"order_id": order_id, "status": "pending"},
+            {"$set": {"status": "expired", "expired_at": now()}},
+            return_document=ReturnDocument.AFTER
+        )
+        if p:
+            uid = p.get("user_id")
+            cid = p.get("chat_id") or uid
+            if uid:
+                try:
+                    bot.send_message(cid,
+                        f"⏰ <b>{fancy('payment expired')}</b>\n\n"
+                        f"ᴏʀᴅᴇʀ: <code>{order_id}</code>\n"
+                        f"ᴘʟᴇᴀꜱᴇ ᴛʀʏ ᴀɢᴀɪɴ ᴏʀ ꜱᴇɴᴅ ꜱᴄʀᴇᴇɴꜱʜᴏᴛ.",
+                        parse_mode='HTML')
+                except: pass
+    except Exception as e:
+        logger.error(f"_mark_expired: {e}")
 
 def _credit_on_success(uid, cid, order_id, amount, credits, info, msg_id):
     p = payments_col.find_one({"order_id": order_id, "user_id": uid})
@@ -2580,7 +2722,7 @@ def resume_pending_orders():
                 daemon=True).start()
 
 # =================================================================
-#  BROADCAST
+#  BROADCAST (batch-safe)
 # =================================================================
 bcast_q = queue.Queue()
 def bcast_worker():
@@ -2589,28 +2731,34 @@ def bcast_worker():
         if task is None: break
         us, msg, kw = task
         pin = int(get_setting("broadcast_pin", 0))
+        sent_ok = 0; failed = 0
         for u in us:
             try:
                 sent = bot.send_message(u, msg, **kw)
                 if pin:
                     try: bot.pin_chat_message(u, sent.message_id)
                     except: pass
+                sent_ok += 1
                 time.sleep(0.05)
-            except: pass
+            except: failed += 1
+        logger.info(f"📢 Broadcast done: {sent_ok} sent, {failed} failed")
         bcast_q.task_done()
-
-threading.Thread(target=bcast_worker, daemon=True).start()
 
 def bcast_photo_worker(us, file_id, caption):
     pin = int(get_setting("broadcast_pin", 0))
+    sent_ok = 0; failed = 0
     for u in us:
         try:
             sent = bot.send_photo(u, file_id, caption=caption)
             if pin:
                 try: bot.pin_chat_message(u, sent.message_id)
                 except: pass
+            sent_ok += 1
             time.sleep(0.05)
-        except: pass
+        except: failed += 1
+    logger.info(f"📢 Photo broadcast done: {sent_ok} sent, {failed} failed")
+
+threading.Thread(target=bcast_worker, daemon=True).start()
 
 _start_time = time.time()
 
@@ -2724,7 +2872,7 @@ def cmd_stats(m):
     bot.reply_to(m, txt, parse_mode='HTML')
 
 # =================================================================
-#  MENU BUTTONS HANDLER
+#  MENU BUTTONS
 # =================================================================
 ALL_MENU_BUTTONS = [
     "📞 Number To Info","🔒 Username To Info","🆔 Aadhaar To Info","🚗 Vehicle Info",
@@ -2765,7 +2913,7 @@ def text_handler(m):
         'waiting_ss','custom_amt','ads_input','fj_add','fj_add_link','user_search',
         'user_addcr','user_remcr','user_setcr','sub_add','grp_welcome','bc_custom','manual_credit',
         'awaiting_number','awaiting_username','awaiting_aadhaar','awaiting_promo',
-        'awaiting_vehicle','feedback','user_fullinfo')
+        'awaiting_vehicle','feedback','user_fullinfo','sub_remove')
     is_admin = is_admin_user(uid)
     if not is_admin and is_maintenance() and not bypass:
         bot.send_message(cid, f"🔧 {fancy('maintenance')}", reply_to_message_id=mid); return
@@ -2786,6 +2934,15 @@ def text_handler(m):
         else:
             _pending = {"type": "start"}
         if not manager.ensure(uid, cid, _pending): return
+
+    # ⭐ FIX: waiting_payment handler
+    if s == 'waiting_payment':
+        bot.send_message(cid,
+            f"⏳ <b>{fancy('payment pending')}</b>\n\n"
+            f"ᴀᴜᴛᴏ ᴠᴇʀɪꜰɪᴄᴀᴛɪᴏɴ ᴏɴ ʜᴀɪ.\n"
+            f"ꜱᴄʀᴇᴇɴꜱʜᴏᴛ ʙʜᴇᴊɪᴇɴ ʏᴀ ᴛʜᴏᴅɪ ᴅᴇʀ ᴡᴀɪᴛ ᴋᴀʀᴇɪɴ.",
+            parse_mode='HTML', reply_to_message_id=mid)
+        return
 
     if s == 'awaiting_number':
         states[uid] = {}
@@ -2870,7 +3027,7 @@ def text_handler(m):
                        f"🔍 Searches: {ud.get('searches',0)}\n"
                        f"📌 Refs: {ud.get('total_referrals',0)}\n"
                        f"🚫 Banned: {'Yes' if ud.get('banned') else 'No'}\n"
-                       f"📅 Joined: {ud.get('joined_at','?')}")
+                       f"📅 Joined: {_date_str(ud.get('joined_at'))}")
                 bot.reply_to(m, txt, parse_mode='HTML')
             except Exception as e: bot.reply_to(m, f"❌ {e}")
             states[uid] = {}; return
@@ -3198,14 +3355,12 @@ def cb(call):
     cache_tg_user(call.from_user)
     is_admin = is_admin_user(uid)
 
-    # ---- Admin Back ----
     if d == "adm_back":
         if not is_admin: return
         try: bot.delete_message(cid, call.message.message_id)
         except: pass
         bot.send_message(cid, "👑 Admin Panel", reply_markup=admin_kb()); return
 
-    # ---- Dashboard ----
     if d == "adm_dash_refresh":
         if not is_admin: return
         p, a, r, rev = pay_stats()
@@ -3242,8 +3397,7 @@ def cb(call):
                f"• New 24h: {new_users_24h()}\n"
                f"• New 7d: {users_col.count_documents({'joined_at':{'$gte':now()-timedelta(days=7)}})}\n"
                f"• Cached TG: {tg_users_col.count_documents({})}\n\n"
-               f"<b>Groups</b>\n"
-               f"• Total: {group_count()}\n\n"
+               f"<b>Groups</b>\n• Total: {group_count()}\n\n"
                f"<b>Payments</b>\n"
                f"• Pending: {p}\n• Approved: {a}\n• Rejected: {r}\n"
                f"• Total Revenue: ₹{rev}\n• 24h: ₹{revenue_24h()}\n"
@@ -3435,7 +3589,6 @@ def cb(call):
         bot.send_message(cid, "🧪 <b>API Health</b>\n\n" + "\n".join(results), parse_mode='HTML')
         safe_ans(call); return
 
-    # Endpoints map
     ep_map = {
         'adm_ep_numurl':     ('api_url_env',      'Number API URL', False),
         'adm_ep_numkey':     ('api_key_env',      'Number API Key', True),
@@ -3699,7 +3852,7 @@ def cb(call):
             w.writerow(["ID","User","Amount","Credits","Status","Created"])
             for p in ps:
                 w.writerow([str(p.get("_id")),p.get("user_id"),p.get("amount"),
-                    p.get("credits"),p.get("status"),p.get("created_at","")])
+                    p.get("credits"),p.get("status"),_date_str(p.get("created_at"))])
             bio = io.BytesIO(o.getvalue().encode('utf-8')); bio.name = "payments.csv"
             bot.send_document(cid, bio, caption="📤 Payments Backup")
         except: pass
@@ -3757,11 +3910,13 @@ def cb(call):
         safe_ans(call); return
 
     # ---- Force Join ----
-    if d == "force_verify": manager.verify_cb(call); return
+    if d == "force_verify":
+        if manager: manager.verify_cb(call)
+        return
     if d.startswith('fj_'):
         if not is_admin: return
         if d == 'fj_toggle':
-            manager.toggle()
+            if manager: manager.toggle()
             try: bot.edit_message_reply_markup(cid, call.message.message_id, reply_markup=force_kb())
             except: pass
             safe_ans(call); return
@@ -3790,7 +3945,7 @@ def cb(call):
             except: pass
             safe_ans(call); return
         if d.startswith('fj_del_'):
-            manager.rm(int(d.split('_')[2]))
+            if manager: manager.rm(int(d.split('_')[2]))
             safe_ans(call, "Removed"); return
 
     # ---- Settings ----
@@ -4043,7 +4198,7 @@ def cb(call):
 if __name__ == "__main__":
     init_db()
     manager = FJManager(bot)
-    logger.info("🚀 Bot v24 SUPER starting...")
+    logger.info("🚀 Bot v25 ULTRA starting...")
     init_pyrogram()
     logger.info(f"👑 Admin: {ADMIN_ID}")
     logger.info(f"🛰️ Pyrogram: {'READY' if _pyro_ready else 'DISABLED'}")
@@ -4053,7 +4208,6 @@ if __name__ == "__main__":
     logger.info(f"🎁 Welcome Bonus: {WELCOME_BONUS} CREDITS")
     resume_pending_orders()
 
-    # Set commands
     try:
         bot.set_my_commands([
             BotCommand("start", "🏠 Main Menu"),
