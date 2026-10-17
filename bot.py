@@ -42,7 +42,7 @@ from collections import deque
 # ---------------------------------------------------------------- #
 API_ID = int(os.getenv("API_ID", "27927621"))
 API_HASH = os.getenv("API_HASH", "215cf515816dd24024bc85b4873afac3")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8779527730:AAGk6ERcfrk_Un5Ewwr7gM7Se9VB-GsPKiQ")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8887984405:AAEvFdc4SwnNKn-f8tbea9xpyz045ZuQkjs")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8125547983"))
 
 def _parse_extra_admin_ids():
